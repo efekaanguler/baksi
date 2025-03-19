@@ -1,4 +1,3 @@
 baksi_env/
-data/
-yolo/datasets/
-yolo/scripts/runs/
+raw_data/
+datasets/
