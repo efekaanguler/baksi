@@ -1,448 +1,543 @@
 import os
+import sys
+import datetime
+import logging
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
-import numpy as np
-import datetime
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import argparse
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.amp import GradScaler
+from torchvision import transforms
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 
-from model import (
-    StrokeDICOMDataset, 
-    BaksiDetection, 
-    PreprocessorLayer,
-    CombinedToEfficientNet,
-    BinaryClassificationHead
+from model import StrokeDICOMDataset, BaksiDetection
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(stream=sys.stdout),
+        logging.FileHandler(f"stroke_training_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    ]
 )
+logger = logging.getLogger()
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Train Baksi Stroke Detection Model')
-    parser.add_argument('--data_dir', type=str, default='../datasets/classification_ds',
-                        help='Directory with train/val/test data')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--save_dir', type=str, default='../saved_models', help='Directory to save models')
-    parser.add_argument('--checkpoint_freq', type=int, default=2, help='Checkpoint frequency in epochs')
-    parser.add_argument('--early_stopping', type=int, default=10, help='Early stopping patience')
-    parser.add_argument('--det_model', type=str, default='../yolo/best_det.pt', help='Detection model path')
-    parser.add_argument('--seg_model', type=str, default='../yolo/best_seg.pt', help='Segmentation model path')
-    parser.add_argument('--scheduler', type=str, default='plateau', help='LR scheduler type: plateau or cosine')
-    parser.add_argument('--warmup_epochs', type=int, default=2, help='Number of warmup epochs')
-    parser.add_argument('--img_size', type=int, default=640, help='Image size')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
-    return parser.parse_args()
+CONFIG = {
+    'data_dir': '../datasets/classification_ds',
+    'yolo_detection_model': '../yolo/best_det.pt',
+    'yolo_segmentation_model': '../yolo/best_seg.pt',
+    'output_dir': '../trained_models',
+    'batch_size': 16,
+    'num_workers': 4,
+    'epochs': 5,
+    'initial_lr': 3e-4,
+    'min_lr': 1e-6,
+    'weight_decay': 1e-4,
+    'pretrained': True,
+    'freeze_backbone_epochs': 5,
+    'image_size': (640, 640),
+    'val_split': 0.15,
+    'test_split': 0.15,
+    'dropout': 0.3,
+    'spatial_dropout': 0.1,
+    'mixup_alpha': 0.2,
+    'label_smoothing': 0.1,
+    'lr_scheduler': 'cosine_warmup',
+    'warmup_epochs': 1,
+    'lr_scheduler_patience': 2,
+    'lr_scheduler_factor': 0.5,
+    'early_stopping_patience': 3,
+    'early_stopping_min_delta': 0.001,
+    'grad_clip': 1.0,
+    'grad_accum_steps': 2,
+    'use_amp': True,
+    'eval_threshold': 0.5,
+    'optimize_threshold': True,
+    'seed': 42,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'log_interval': 10,
+}
 
-def get_stroke_dataloaders(data_root, batch_size=32, img_size=(640, 640), 
-                          num_workers=4, transforms=None):
-    """
-    Create train, validation and test DataLoaders for stroke detection DICOM data
-    
-    Args:
-        data_root: Root directory containing 'train', 'val', and 'test' folders,
-                  each with 'class_0' and 'class_1' subfolders
-        batch_size: Batch size (default 32)
-        img_size: Target image size (height, width)
-        num_workers: Number of workers for loading data
-        transforms: Dictionary with optional transforms for each split
-                   e.g., {'train': transform_train, 'val': transform_val, 'test': transform_test}
-        
-    Returns:
-        Dictionary with train, val, test dataloaders
-    """
-    # Setup transforms
-    if transforms is None:
-        transforms = {
-            'train': None,
-            'val': None,
-            'test': None
-        }
-    
-    dataloaders = {}
-    splits = ['train', 'val', 'test']
-    
-    # Create a dataloader for each split
-    for split in splits:
-        split_dir = os.path.join(data_root, split)
-        
-        if not os.path.exists(split_dir):
-            print(f"Warning: {split_dir} does not exist. Skipping {split} split.")
-            continue
-        
-        # Create dataset
-        dataset = StrokeDICOMDataset(
-            root_dir=split_dir,
-            img_size=img_size,
-            transform=transforms.get(split)
-        )
-        
-        # Print dataset statistics
-        class0_count = sum(1 for _, label in dataset.samples if label == 0)
-        class1_count = sum(1 for _, label in dataset.samples if label == 1)
-        print(f"{split.capitalize()} dataset loaded with {len(dataset)} samples:")
-        print(f"  - Class 0 (no stroke): {class0_count} samples")
-        print(f"  - Class 1 (stroke): {class1_count} samples")
-        
-        # Create dataloader
-        dataloaders[split] = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=(split == 'train'),  # Only shuffle training data
-            num_workers=num_workers,
-            pin_memory=True
-        )
-    
-    return dataloaders
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-def get_lr_scheduler(optimizer, args, train_loader_len):
-    """Create learning rate scheduler with optional warmup"""
-    if args.scheduler.lower() == 'plateau':
-        # ReduceLROnPlateau: reduce LR when validation loss plateaus
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, 
-                                     patience=5, verbose=True)
-    elif args.scheduler.lower() == 'cosine':
-        # CosineAnnealingLR: gradually decreases LR following a cosine curve
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    else:
-        raise ValueError(f"Unknown scheduler type: {args.scheduler}")
-    
-    return scheduler
+set_seed(CONFIG['seed'])
 
-def warmup_learning_rate(optimizer, epoch, batch_idx, total_batches, warmup_epochs, base_lr):
-    """Gradually warm up learning rate during early epochs"""
-    if epoch >= warmup_epochs:
-        return
-    
-    # Calculate current progress through warmup (0 to 1)
-    progress = (epoch * total_batches + batch_idx) / (warmup_epochs * total_batches)
-    
-    # Adjust learning rate: start from 10% of base_lr, gradually increase to base_lr
-    new_lr = base_lr * (0.1 + 0.9 * progress)
-    
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = new_lr
 
-def train_model(model, dataloaders, criterion, optimizer, args, device='cuda'):
-    """
-    Train the BaksiDetection model with visualization and dynamic learning rate
-    
-    Args:
-        model: BaksiDetection model
-        dataloaders: Dictionary containing 'train' and 'val' dataloaders
-        criterion: Loss function
-        optimizer: Optimizer for model parameters
-        args: Training arguments
-        device: Device to train on
+class MedicalImageTransforms:
+    def __init__(self, intensity='medium', image_size=(640, 640)):
+        self.intensity = intensity
+        self.image_size = image_size
         
-    Returns:
-        Dictionary containing trained model and training history
-    """
-    # Create save directory if it doesn't exist
-    save_dir = args.save_dir
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Generate timestamp for unique filenames
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Get train and validation loaders
-    train_loader = dataloaders['train']
-    val_loader = dataloaders.get('val')
-    
-    # Create learning rate scheduler
-    scheduler = get_lr_scheduler(optimizer, args, len(train_loader))
-    
-    # Track training history
-    history = {
-        'train_loss': [],
-        'train_acc': [],
-        'val_loss': [],
-        'val_acc': [],
-        'learning_rates': []
-    }
-    
-    # For tracking best model
-    best_val_acc = 0.0
-    best_val_loss = float('inf')
-    best_epoch = 0
-    best_model_path = None
-    no_improvement_count = 0
-    
-    # Training loop with progress bar for epochs
-    epoch_pbar = tqdm(range(args.epochs), desc="Training", unit="epoch")
-    for epoch in epoch_pbar:
-        # Track metrics for current epoch
-        epoch_loss = 0
-        epoch_acc = 0
-        steps = 0
-        
-        # Set model to training mode
-        model.train()
-        
-        # Progress bar for batches
-        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", 
-                          leave=False, unit="batch")
-        
-        # Track current learning rate
-        current_lr = optimizer.param_groups[0]['lr']
-        history['learning_rates'].append(current_lr)
-        
-        # Training loop for current epoch
-        for batch_idx, batch in enumerate(batch_pbar):
-            # Apply learning rate warmup if in warmup phase
-            if args.warmup_epochs > 0:
-                warmup_learning_rate(optimizer, epoch, batch_idx, len(train_loader), 
-                                    args.warmup_epochs, args.lr)
-            
-            # Forward pass and calculate loss
-            metrics = model.train_step(batch, criterion, optimizer)
-            
-            # Update metrics
-            epoch_loss += metrics['loss']
-            epoch_acc += metrics['accuracy']
-            steps += 1
-            
-            # Update progress bar
-            batch_pbar.set_postfix({
-                "loss": f"{metrics['loss']:.4f}", 
-                "acc": f"{metrics['accuracy']:.4f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
-            })
-        
-        # Calculate epoch metrics
-        avg_train_loss = epoch_loss / steps
-        avg_train_acc = epoch_acc / steps
-        
-        # Store in history
-        history['train_loss'].append(avg_train_loss)
-        history['train_acc'].append(avg_train_acc)
-        
-        # Validation phase
-        val_loss = 0
-        current_val_acc = 0
-        
-        if val_loader:
-            val_metrics = model.evaluate(val_loader, criterion)
-            val_loss = val_metrics['loss']
-            current_val_acc = val_metrics['accuracy']
-            
-            history['val_loss'].append(val_loss)
-            history['val_acc'].append(current_val_acc)
-            
-            # Update main progress bar with validation metrics
-            epoch_pbar.set_postfix({
-                "train_loss": f"{avg_train_loss:.4f}",
-                "train_acc": f"{avg_train_acc:.4f}",
-                "val_loss": f"{val_loss:.4f}",
-                "val_acc": f"{current_val_acc:.4f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
-            })
-            
-            # Update learning rate based on validation loss
-            if args.scheduler.lower() == 'plateau':
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
-            
-            # Check if this is the best model so far
-            is_best = False
-            if current_val_acc > best_val_acc:
-                best_val_acc = current_val_acc
-                best_epoch = epoch + 1
-                is_best = True
-                
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                if not is_best:  # Don't count twice if both improved
-                    is_best = True
-            
-            if is_best:
-                # Save best model
-                best_model_path = os.path.join(save_dir, f"model_best_{timestamp}.pth")
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
-                    'val_accuracy': best_val_acc,
-                    'val_loss': best_val_loss,
-                    'history': history,
-                }, best_model_path)
-                print(f"\nNew best model saved with val_acc: {best_val_acc:.4f}, val_loss: {best_val_loss:.4f}")
-                
-                # Reset no improvement counter
-                no_improvement_count = 0
-            else:
-                no_improvement_count += 1
-                
-            # Early stopping check
-            if args.early_stopping is not None and no_improvement_count >= args.early_stopping:
-                print(f"\nEarly stopping triggered after {no_improvement_count} epochs without improvement")
-                break
+    def get_train_transforms(self):
+        if self.intensity == 'light':
+            return transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+                self._random_gamma_correction,
+                self._random_window_adjustment,
+            ])
+        elif self.intensity == 'medium':
+            return transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(15),
+                transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                self._random_gamma_correction,
+                self._random_window_adjustment,
+                self._random_noise,
+                transforms.RandomApply([self._simulate_low_contrast], p=0.2),
+            ])
+        elif self.intensity == 'strong':
+            return transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(30),
+                transforms.RandomAffine(degrees=30, translate=(0.15, 0.15), scale=(0.85, 1.15)),
+                self._random_gamma_correction,
+                self._random_window_adjustment,
+                self._random_noise,
+                transforms.RandomApply([self._simulate_low_contrast], p=0.3),
+                transforms.RandomApply([self._simulate_motion_artifact], p=0.2),
+                transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
+            ])
         else:
-            # If no validation set, just update with training metrics
-            epoch_pbar.set_postfix({
-                "train_loss": f"{avg_train_loss:.4f}",
-                "train_acc": f"{avg_train_acc:.4f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
-            })
+            raise ValueError(f"Unsupported intensity level: {self.intensity}")
             
-            # Update learning rate scheduler if it's not ReduceLROnPlateau
-            if args.scheduler.lower() != 'plateau':
-                scheduler.step()
+    def get_val_transforms(self):
+        return transforms.Compose([])
+    
+    def _random_gamma_correction(self, img):
+        if torch.rand(1).item() > 0.5:
+            gamma = torch.distributions.uniform.Uniform(0.8, 1.2).sample().item()
+            return transforms.functional.adjust_gamma(img, gamma)
+        return img
         
-        # Save model checkpoint periodically
-        if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
-            model_save_path = os.path.join(save_dir, f"model_epoch{epoch+1}_{timestamp}.pth")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
-                'history': history,
-            }, model_save_path)
-            print(f"\nModel checkpoint saved to {model_save_path}")
+    def _random_window_adjustment(self, img):
+        if torch.rand(1).item() > 0.5:
+            brightness = torch.distributions.uniform.Uniform(0.9, 1.1).sample().item()
+            contrast = torch.distributions.uniform.Uniform(0.9, 1.1).sample().item()
+            return transforms.functional.adjust_brightness(
+                transforms.functional.adjust_contrast(img, contrast),
+                brightness
+            )
+        return img
+        
+    def _random_noise(self, img):
+        if torch.rand(1).item() > 0.5:
+            noise_level = torch.distributions.uniform.Uniform(0.01, 0.05).sample().item()
+            noise = torch.randn(img.size()) * noise_level
+            noisy_img = img + noise
+            return torch.clamp(noisy_img, 0, 1)
+        return img
+        
+    def _simulate_low_contrast(self, img):
+        alpha = torch.distributions.uniform.Uniform(0.5, 0.9).sample().item()
+        mean = img.mean()
+        return alpha * img + (1 - alpha) * mean
+        
+    def _simulate_motion_artifact(self, img):
+        strength = torch.distributions.uniform.Uniform(2, 5).sample().item()
+        angle = torch.distributions.uniform.Uniform(0, 180).sample().item()
+        kernel = torch.zeros((int(strength), int(strength)))
+        center = int(strength) // 2
+        for i in range(int(strength)):
+            kernel[center, i] = 1.0 / int(strength)
+        
+        blurred = transforms.functional.gaussian_blur(img, kernel_size=int(strength))
+        blend_factor = torch.distributions.uniform.Uniform(0.1, 0.3).sample().item()
+        return img * (1 - blend_factor) + blurred * blend_factor
     
-    # Plot and save training curves
-    plot_training_curves(history, save_dir, timestamp)
-    
-    # Save final model
-    final_model_path = os.path.join(save_dir, f"model_final_{timestamp}.pth")
-    torch.save({
-        'epoch': args.epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
-        'history': history,
-    }, final_model_path)
-    print(f"Final model saved to {final_model_path}")
-    
-    # Print best model information
-    if best_model_path:
-        print(f"Best model was from epoch {best_epoch} with val_acc: {best_val_acc:.4f}, val_loss: {best_val_loss:.4f}")
-        print(f"Best model saved to: {best_model_path}")
-    
-    return {
-        'model': model,
-        'history': history,
-        'model_path': final_model_path,
-        'best_model_path': best_model_path,
-        'best_val_acc': best_val_acc,
-        'best_val_loss': best_val_loss,
-        'plot_path': os.path.join(save_dir, f"training_curves_{timestamp}.png")
-    }
 
-def plot_training_curves(history, save_dir, timestamp=None):
-    """
-    Plot training and validation curves including learning rate
+        
+def prepare_datasets(data_dir, image_size=(640, 640)):
+    train_dir = os.path.join(data_dir, 'train')
+    val_dir = os.path.join(data_dir, 'val')
+    test_dir = os.path.join(data_dir, 'test')
     
-    Args:
-        history: Dictionary containing training and validation metrics
-        save_dir: Directory to save the plot
-        timestamp: Optional timestamp for unique filename
-    """
-    if timestamp is None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    transforms = MedicalImageTransforms(intensity='medium', image_size=image_size)
+    train_transform = transforms.get_train_transforms()
+    val_transform = transforms.get_val_transforms()
     
-    # Create figure with three subplots
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15))
+    train_dataset = StrokeDICOMDataset(train_dir, img_size=image_size, transform=train_transform)
+    val_dataset = StrokeDICOMDataset(val_dir, img_size=image_size, transform=val_transform)
+    test_dataset = StrokeDICOMDataset(test_dir, img_size=image_size, transform=val_transform)
     
+    logger.info(f"Dataset split complete - Train: {len(train_dataset)}, "
+                f"Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+                
+    return train_dataset, val_dataset, test_dataset
+
+def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=8, num_workers=4):
+    train_labels = [sample[1] for sample in train_dataset.samples]
+    class_counts = {0: train_labels.count(0), 1: train_labels.count(1)}
+    num_samples = len(train_labels)
+    weights = [num_samples / (class_counts[label] * len(class_counts)) for label in train_labels]
+    sampler = WeightedRandomSampler(weights, num_samples=num_samples, replacement=True)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader, test_loader
+
+def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch, grad_accum_steps, log_interval):
+    model.train()
+    running_loss = 0.0
+    optimizer.zero_grad()
+    
+    for batch_idx, (inputs, targets) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
+        inputs, targets = inputs.to(device), targets.to(device)
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(1)
+        
+        with torch.amp.autocast(device_type='cuda', enabled=CONFIG['use_amp']):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss = loss / grad_accum_steps
+        
+        scaler.scale(loss).backward()
+        
+        if (batch_idx + 1) % grad_accum_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+        
+        running_loss += loss.item() * grad_accum_steps
+
+        if batch_idx % log_interval == 0:
+
+            torch.cuda.empty_cache()
+    
+    avg_loss = running_loss / len(train_loader.dataset)
+    return avg_loss
+
+def validate_epoch(model, val_loader, criterion, device):
+    model.eval()
+    val_loss = 0.0
+    all_targets = []
+    all_predictions = []
+    all_raw_preds = []
+    
+    with torch.no_grad():
+        for inputs, targets in tqdm(val_loader, desc="Validation"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            if targets.dim() == 1:
+                targets = targets.unsqueeze(1)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            val_loss += loss.item()
+            
+            predictions = torch.sigmoid(outputs).cpu().numpy()
+            all_targets.extend(targets.cpu().numpy())
+            all_predictions.extend(predictions)
+            all_raw_preds.extend(outputs.cpu().numpy())
+    
+    avg_loss = val_loss / len(val_loader.dataset)
+    all_targets = np.array(all_targets)
+    all_predictions = np.array(all_predictions)
+    
+    threshold = CONFIG['eval_threshold']
+    if CONFIG['optimize_threshold']:
+        best_f1 = 0
+        best_threshold = 0.5
+        for t in np.arange(0.1, 0.9, 0.05):
+            temp_f1 = f1_score(all_targets, all_predictions > t, zero_division=1)
+            if temp_f1 > best_f1:
+                best_f1 = temp_f1
+                best_threshold = t
+        threshold = best_threshold
+        logger.info(f"Optimized threshold: {threshold:.3f}")
+    
+    accuracy = accuracy_score(all_targets, all_predictions > threshold)
+    precision = precision_score(all_targets, all_predictions > threshold, zero_division=1)
+    recall = recall_score(all_targets, all_predictions > threshold, zero_division=1)
+    f1 = f1_score(all_targets, all_predictions > threshold, zero_division=1)
+    roc_auc = roc_auc_score(all_targets, all_predictions)
+    
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'threshold': threshold
+    }
+    
+    return avg_loss, metrics
+
+def plot_training_curves(history, output_dir):
     epochs = range(1, len(history['train_loss']) + 1)
     
-    # Loss subplot
-    ax1.plot(epochs, history['train_loss'], 'b-', marker='o', markersize=3, label='Training Loss')
-    if 'val_loss' in history and history['val_loss']:
-        ax1.plot(epochs, history['val_loss'], 'r-', marker='s', markersize=3, label='Validation Loss')
-    ax1.set_title('Training and Validation Loss', fontsize=14)
-    ax1.set_xlabel('Epochs')
-    ax1.set_ylabel('Loss')
-    ax1.legend(loc='upper right')
-    ax1.grid(True, alpha=0.3)
+    plt.figure(figsize=(12, 8), dpi=300)
     
-    # Accuracy subplot
-    ax2.plot(epochs, history['train_acc'], 'b-', marker='o', markersize=3, label='Training Accuracy')
-    if 'val_acc' in history and history['val_acc']:
-        ax2.plot(epochs, history['val_acc'], 'r-', marker='s', markersize=3, label='Validation Accuracy')
-    ax2.set_title('Training and Validation Accuracy', fontsize=14)
-    ax2.set_xlabel('Epochs')
-    ax2.set_ylabel('Accuracy')
-    ax2.legend(loc='lower right')
-    ax2.grid(True, alpha=0.3)
+    # Plot loss
+    plt.subplot(2, 3, 1)
+    plt.plot(epochs, history['train_loss'], label='Train Loss')
+    plt.plot(epochs, history['val_loss'], label='Val Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss')
     
-    # Learning rate subplot
-    if 'learning_rates' in history and history['learning_rates']:
-        ax3.plot(epochs, history['learning_rates'], 'g-', marker='o', markersize=3)
-        ax3.set_title('Learning Rate', fontsize=14)
-        ax3.set_xlabel('Epochs')
-        ax3.set_ylabel('Learning Rate')
-        ax3.set_yscale('log')  # Log scale for better visualization
-        ax3.grid(True, alpha=0.3)
+    # Plot accuracy
+    plt.subplot(2, 3, 2)
+    plt.plot(epochs, history['train_accuracy'], label='Train Accuracy')
+    plt.plot(epochs, history['val_accuracy'], label='Val Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Accuracy')
     
-    # Adjust spacing between subplots
+    # Plot precision
+    plt.subplot(2, 3, 3)
+    plt.plot(epochs, history['train_precision'], label='Train Precision')
+    plt.plot(epochs, history['val_precision'], label='Val Precision')
+    plt.xlabel('Epochs')
+    plt.ylabel('Precision')
+    plt.legend()
+    plt.title('Precision')
+    
+    # Plot recall
+    plt.subplot(2, 3, 4)
+    plt.plot(epochs, history['train_recall'], label='Train Recall')
+    plt.plot(epochs, history['val_recall'], label='Val Recall')
+    plt.xlabel('Epochs')
+    plt.ylabel('Recall')
+    plt.legend()
+    plt.title('Recall')
+    
+    # Plot F1 score
+    plt.subplot(2, 3, 5)
+    plt.plot(epochs, history['train_f1'], label='Train F1')
+    plt.plot(epochs, history['val_f1'], label='Val F1')
+    plt.xlabel('Epochs')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.title('F1 Score')
+    
+    # Plot ROC AUC
+    plt.subplot(2, 3, 6)
+    plt.plot(epochs, history['train_roc_auc'], label='Train ROC AUC')
+    plt.plot(epochs, history['val_roc_auc'], label='Val ROC AUC')
+    plt.xlabel('Epochs')
+    plt.ylabel('ROC AUC')
+    plt.legend()
+    plt.title('ROC AUC')
+    
     plt.tight_layout()
-    
-    # Save figure
-    plot_path = os.path.join(save_dir, f"training_curves_{timestamp}.png")
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    print(f"Training curves saved to {plot_path}")
-    
-    # Close figure to free memory
-    plt.close(fig)
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'))
+    plt.close()
 
-def main():
-    """Main function to run the training"""
-    # Parse command line arguments
-    args = parse_arguments()
+def plot_training_curves_with_focal_params(history, output_dir):
+    epochs = range(1, len(history['train_loss']) + 1)
     
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    plt.figure(figsize=(15, 10), dpi=300)
     
-    # Initialize model
-    print("Initializing model...")
+    # Plot loss
+    plt.subplot(3, 3, 1)
+    plt.plot(epochs, history['train_loss'], label='Train Loss')
+    plt.plot(epochs, history['val_loss'], label='Val Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss')
+    
+    # Plot accuracy
+    plt.subplot(3, 3, 2)
+    plt.plot(epochs, history['train_accuracy'], label='Train Accuracy')
+    plt.plot(epochs, history['val_accuracy'], label='Val Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Accuracy')
+    
+    # Plot precision
+    plt.subplot(3, 3, 3)
+    plt.plot(epochs, history['train_precision'], label='Train Precision')
+    plt.plot(epochs, history['val_precision'], label='Val Precision')
+    plt.xlabel('Epochs')
+    plt.ylabel('Precision')
+    plt.legend()
+    plt.title('Precision')
+    
+    # Plot recall
+    plt.subplot(3, 3, 4)
+    plt.plot(epochs, history['train_recall'], label='Train Recall')
+    plt.plot(epochs, history['val_recall'], label='Val Recall')
+    plt.xlabel('Epochs')
+    plt.ylabel('Recall')
+    plt.legend()
+    plt.title('Recall')
+    
+    # Plot F1 score
+    plt.subplot(3, 3, 5)
+    plt.plot(epochs, history['train_f1'], label='Train F1')
+    plt.plot(epochs, history['val_f1'], label='Val F1')
+    plt.xlabel('Epochs')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.title('F1 Score')
+    
+    # Plot ROC AUC
+    plt.subplot(3, 3, 6)
+    plt.plot(epochs, history['train_roc_auc'], label='Train ROC AUC')
+    plt.plot(epochs, history['val_roc_auc'], label='Val ROC AUC')
+    plt.xlabel('Epochs')
+    plt.ylabel('ROC AUC')
+    plt.legend()
+    plt.title('ROC AUC')
+    
+    # Plot Focal Loss Alpha
+    plt.subplot(3, 3, 7)
+    plt.plot(epochs, history['focal_alpha'], label='Alpha')
+    plt.xlabel('Epochs')
+    plt.ylabel('Alpha')
+    plt.title('Focal Loss Alpha')
+    
+    # Plot Focal Loss Gamma
+    plt.subplot(3, 3, 8)
+    plt.plot(epochs, history['focal_gamma'], label='Gamma')
+    plt.xlabel('Epochs')
+    plt.ylabel('Gamma')
+    plt.title('Focal Loss Gamma')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves_with_focal_params.png'))
+    plt.close()
+    
+    plot_training_curves(history, output_dir)
+
+def train():
+    set_seed(CONFIG['seed'])
+    
+    train_dataset, val_dataset, test_dataset = prepare_datasets(CONFIG['data_dir'], CONFIG['image_size'])
+    
     model = BaksiDetection(
-        det_model_path=args.det_model,
-        seg_model_path=args.seg_model,
-        device=device
-    )
+        det_model_path=CONFIG['yolo_detection_model'],
+        seg_model_path=CONFIG['yolo_segmentation_model'],
+        pretrained=CONFIG['pretrained'],
+        device=CONFIG['device']
+    ).to(CONFIG['device'])
     
-    # Set up dataloaders
-    print(f"Loading datasets from {args.data_dir}...")
-    dataloaders = get_stroke_dataloaders(
-        data_root=args.data_dir, 
-        batch_size=args.batch_size,
-        img_size=(args.img_size, args.img_size),
-        num_workers=args.num_workers
-    )
+    criterion = nn.BCEWithLogitsLoss().to(CONFIG['device'])
     
-    # Define loss function and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.classifier.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['initial_lr'], weight_decay=CONFIG['weight_decay'])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=CONFIG['min_lr'])
     
-    print("\n" + "="*50)
-    print("Starting training with parameters:")
-    print(f"- Learning rate: {args.lr}")
-    print(f"- Batch size: {args.batch_size}")
-    print(f"- Epochs: {args.epochs}")
-    print(f"- LR Scheduler: {args.scheduler}")
-    print(f"- Warmup epochs: {args.warmup_epochs}")
-    print(f"- Early stopping patience: {args.early_stopping}")
-    print("="*50 + "\n")
+    scaler = GradScaler(device="cuda", enabled=CONFIG['use_amp'])
     
-    # Train model
-    results = train_model(
-        model=model,
-        dataloaders=dataloaders,
-        criterion=criterion,
-        optimizer=optimizer,
-        args=args,
-        device=device
-    )
+    best_val_loss = float('inf')
+    best_model_wts = None
     
-    print("\nTraining completed!")
-    return results
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_accuracy': [],
+        'val_accuracy': [],
+        'train_precision': [],
+        'val_precision': [],
+        'train_recall': [],
+        'val_recall': [],
+        'train_f1': [],
+        'val_f1': [],
+        'train_roc_auc': [],
+        'val_roc_auc': []
+    }
+    
+    for epoch in range(1, CONFIG['epochs'] + 1):
+        if epoch <= CONFIG['freeze_backbone_epochs']:
+            model.freeze_backbone()
+            logger.info("EfficientNet backbones are frozen")
+            current_batch_size = 16
+            current_grad_accum_steps = CONFIG['grad_accum_steps']
+        else:
+            model.unfreeze_backbone()
+            logger.info("EfficientNet backbones are unfrozen and trainable")
+            current_batch_size = 2
+            current_grad_accum_steps = 8
+        
+        # Create dataloaders with current batch size
+        train_loader, val_loader, test_loader = create_dataloaders(
+            train_dataset, val_dataset, test_dataset, 
+            batch_size=current_batch_size, 
+            num_workers=CONFIG['num_workers']
+        )
+        
+        train_loss = train_epoch(
+            model, train_loader, criterion, optimizer, scaler, 
+            CONFIG['device'], epoch, current_grad_accum_steps, CONFIG['log_interval']
+        )
+        val_loss, val_metrics = validate_epoch(model, val_loader, criterion, CONFIG['device'])
+        
+        logger.info(f"Epoch {epoch}: Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, "
+                    f"Batch Size: {current_batch_size}, Grad Accum Steps: {current_grad_accum_steps}, "
+                    f"Val Accuracy: {val_metrics['accuracy']:.4f}, Val Precision: {val_metrics['precision']:.4f}, "
+                    f"Val Recall: {val_metrics['recall']:.4f}, Val F1: {val_metrics['f1']:.4f}, "
+                    f"Val ROC AUC: {val_metrics['roc_auc']:.4f}, "
+                    f"Threshold: {val_metrics.get('threshold', CONFIG['eval_threshold']):.2f}")
+        
+        scheduler.step()
+        
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_accuracy'].append(val_metrics['accuracy'])
+        history['val_accuracy'].append(val_metrics['accuracy'])
+        history['train_precision'].append(val_metrics['precision'])
+        history['val_precision'].append(val_metrics['precision'])
+        history['train_recall'].append(val_metrics['recall'])
+        history['val_recall'].append(val_metrics['recall'])
+        history['train_f1'].append(val_metrics['f1'])
+        history['val_f1'].append(val_metrics['f1'])
+        history['train_roc_auc'].append(val_metrics['roc_auc'])
+        history['val_roc_auc'].append(val_metrics['roc_auc'])
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_wts = model.state_dict()
+        
+        if epoch % 5 == 0:
+            torch.save(model.state_dict(), os.path.join(CONFIG['output_dir'], f'model_epoch_{epoch}.pth'))
+        
+        torch.cuda.empty_cache()
+    
+    if best_model_wts is not None:
+        model.load_state_dict(best_model_wts)
+    
+    os.makedirs(CONFIG['output_dir'], exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(CONFIG['output_dir'], 'best_model.pth'))
+    
+    plot_training_curves(history, CONFIG['output_dir'])
+    
+    logger.info("Training complete.")
+    return model
 
 if __name__ == "__main__":
-    main()
+    model = train()

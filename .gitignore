@@ -1,3 +1,8 @@
 baksi_env/
 raw_data/
 datasets/
+saved_models/
+test_results/
+yolo/runs/
+yolo/best_det.pt
+yolo/best_seg.pt

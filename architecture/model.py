@@ -5,10 +5,8 @@ import torch.nn.functional as F
 import numpy as np
 import pydicom
 import cv2
-import matplotlib.pyplot as plt
-import datetime
-from torch.utils.data import Dataset, DataLoader
-from torchvision import models
+from torch.utils.data import Dataset
+from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
 from ultralytics import YOLO
 
 class StrokeDICOMDataset(Dataset):
@@ -25,8 +23,8 @@ class StrokeDICOMDataset(Dataset):
         self.root_dir = root_dir
         self.img_size = img_size
         self.transform = transform
+        self.preprocessor = PreprocessorLayer(output_size=img_size)
         
-        # List all DICOM files and their corresponding labels
         self.samples = []
         
         # Class 0 files
@@ -49,134 +47,65 @@ class StrokeDICOMDataset(Dataset):
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
         
-        # Use preprocess_dicom function for preprocessing
         try:
-            # Preprocess DICOM
-            processed_img = preprocess_dicom(img_path, normalize_size=self.img_size)
+            img_tensor = self.preprocessor.process_single_dicom(img_path)
             
-            # Convert to tensor and normalize to [0,1]
-            img_tensor = torch.from_numpy(processed_img.transpose(2, 0, 1)).float() / 255.0
-            
-            # Apply additional transforms if provided
             if self.transform:
                 img_tensor = self.transform(img_tensor)
             
-            # Return image and label
-            return img_tensor, torch.tensor(label, dtype=torch.long)
+            return img_tensor, torch.tensor(label, dtype=torch.float)
             
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            # Return a placeholder on error
             placeholder = torch.zeros((3, self.img_size[0], self.img_size[1]), dtype=torch.float32)
-            return placeholder, torch.tensor(label, dtype=torch.long)
+            return placeholder, torch.tensor(label, dtype=torch.float)
         
 class YOLOPredictor:
     def __init__(self, det_model_name, seg_model_name):
         """
-        Initialize with both detection and segmentation models (both required)
-        
-        Args:
-            det_model: YOLO model for object detection
-            seg_model: YOLO model for segmentation
+        Initialize with both detection and segmentation models.
         """
         self.det_model = YOLO(det_model_name)
         self.seg_model = YOLO(seg_model_name)
     
-    def get_detection_data(self, images, conf=0.25):
+    def get_detection_data(self, images, conf=0.001):
         """
-        Process images and return detection data suitable for DetectionToEfficientNet
-        
-        Args:
-            images: List of image paths or numpy arrays
-            conf: Confidence threshold
-            
-        Returns:
-            List of tensors with detection data [x, y, w, h, conf, cls]
+        Process images and return detection data formatted for the feature extractor.
         """
-        # Run inference with detection model
-        results = self.det_model(images, conf=conf)
-        
-        # Format detections for DetectionToEfficientNet
+        results = self.det_model(images, conf=conf, verbose=False)
         batch_detections = []
-        
         for result in results:
-            # Get boxes (normalized xywh format)
             if result.boxes.xywh.shape[0] > 0:
-                # Get xywh, confidence, and class
-                xywh = result.boxes.xywh.cpu() / torch.tensor([result.orig_shape[1], result.orig_shape[0], 
-                                                               result.orig_shape[1], result.orig_shape[0]])
-                conf = result.boxes.conf.cpu().unsqueeze(1)
-                cls = result.boxes.cls.cpu().unsqueeze(1)
-                
-                # Combine into [x, y, w, h, conf, cls]
-                detections = torch.cat((xywh, conf, cls), dim=1)
+                xywh = result.boxes.xywh.cpu() / torch.tensor(
+                    [result.orig_shape[1], result.orig_shape[0],
+                     result.orig_shape[1], result.orig_shape[0]]
+                )
+                conf_tensor = result.boxes.conf.cpu().unsqueeze(1)
+                cls_tensor = result.boxes.cls.cpu().unsqueeze(1)
+                detections = torch.cat((xywh, conf_tensor, cls_tensor), dim=1)
             else:
                 detections = torch.zeros((0, 6))
-                
             batch_detections.append(detections)
-            
         return batch_detections
     
-    def get_segmentation_data(self, images, conf=0.25):
+    def get_segmentation_data(self, images, conf=0.001):
         """
-        Process images and return segmentation data suitable for SegmentationToEfficientNet
+        Process images and return segmentation data from YOLO model
         
         Args:
             images: List of image paths or numpy arrays
             conf: Confidence threshold
             
         Returns:
-            List of tensors with segmentation data [cls, x1, y1, x2, y2, ...]
+            Raw segmentation results from YOLO model
         """
-        # Run inference with segmentation model
-        results = self.seg_model(images, conf=conf)
-        
-        # Format segmentations for SegmentationToEfficientNet
-        batch_segmentations = []
-        
-        for result in results:
-            image_segmentations = []
-            
-            # Check if any masks were found
-            if hasattr(result, 'masks') and result.masks is not None:
-                for i, mask in enumerate(result.masks.data):
-                    # Get class
-                    cls = result.boxes.cls[i].item()
-                    
-                    # Get polygon points from mask
-                    # Extract contours from the mask
-                    mask_np = mask.cpu().numpy()
-                    contours, _ = cv2.findContours((mask_np * 255).astype(np.uint8), 
-                                                  cv2.RETR_EXTERNAL, 
-                                                  cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    # Process largest contour (simplify it to reduce points)
-                    if contours:
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        epsilon = 0.005 * cv2.arcLength(largest_contour, True)
-                        approx = cv2.approxPolyDP(largest_contour, epsilon, True)
-                        
-                        # Format for YOLO: [cls, x1, y1, x2, y2, ...]
-                        points = approx.reshape(-1) / np.array([result.orig_shape[1], result.orig_shape[0]] * (len(approx.reshape(-1)) // 2))
-                        seg_data = torch.tensor([cls] + points.tolist())
-                        image_segmentations.append(seg_data)
-            
-            # If no masks, add empty tensor
-            if not image_segmentations:
-                batch_segmentations.append(torch.zeros((0, 1)))
-            else:
-                batch_segmentations.append(torch.stack(image_segmentations))
-        
-        return batch_segmentations
+
+        results = self.seg_model(images, conf=conf, verbose=False)
+        return results
     
-    def process_batch(self, images, conf=0.25):
+    def process_batch(self, images, conf=0.001):
         """
-        Process a batch of images with both detection and segmentation models
-        
-        Args:
-            images: List of image paths or numpy arrays
-            conf: Confidence threshold
-            
+        Process a batch of images with both detection and segmentation models.
         Returns:
             Tuple of (detection_data, segmentation_data)
         """
@@ -199,7 +128,6 @@ class PreprocessorLayer(nn.Module):
         super(PreprocessorLayer, self).__init__()
         self.output_size = output_size
         
-        # Window settings for brain CT optimized for stroke detection
         self.window_settings = [
             {"center": 35, "width": 45},   # Stroke window - for early ischemic changes
             {"center": 40, "width": 80},   # Standard brain window - for brain parenchyma
@@ -212,345 +140,320 @@ class PreprocessorLayer(nn.Module):
         
         Args:
             x: List of DICOM file paths, or batch of already loaded pixel data
-               If tensor, expected shape is [batch_size, H, W]
+               If tensor, expected shape is [batch_size, H, W] or [batch_size, C, H, W]
                
         Returns:
             torch.Tensor of shape [batch_size, 3, H, W] with processed images
         """
         if isinstance(x, list):
-            # Process list of file paths
-            batch_size = len(x)
-            processed_batch = []
-            
-            for dicom_path in x:
-                processed_img = self.process_single_dicom(dicom_path)
-                processed_batch.append(processed_img)
-                
-            # Stack tensors along batch dimension
+            processed_batch = [self.process_single_dicom(dicom_path) for dicom_path in x]
             return torch.stack(processed_batch)
         
         elif isinstance(x, torch.Tensor):
-            # Process batch tensor
-            batch_size = x.shape[0]
-            device = x.device
-            processed_batch = []
+            if x.dim() == 4 and x.shape[1] == 3:
+                return x
             
-            # Process each image in the batch
-            for i in range(batch_size):
-                # Convert single image to numpy
-                img_np = x[i].detach().cpu().numpy()
-                
-                # Apply preprocessing
-                img_channels = self.apply_windows_and_clahe(img_np)
-                
-                # Convert back to tensor
-                img_tensor = torch.tensor(img_channels, dtype=torch.float32, device=device)
-                processed_batch.append(img_tensor)
-                
+            processed_batch = []
+            for img in x:
+                processed_batch.append(self.process_single_tensor(img))
             return torch.stack(processed_batch)
         
         else:
             raise ValueError("Input must be either a list of DICOM paths or a batch tensor")
             
-    def process_single_dicom(self, dicom_path_or_data):
-        """Process a single DICOM file or dataset"""
-        # Load DICOM if path is provided
-        if isinstance(dicom_path_or_data, str):
-            dicom_data = pydicom.dcmread(dicom_path_or_data)
-        else:
-            dicom_data = dicom_path_or_data
+    def process_single_dicom(self, dicom_path):
+        """Process a single DICOM file"""
+        try:
+            dicom_data = pydicom.dcmread(dicom_path)
+            dicom_array = dicom_data.pixel_array
+            
+            if hasattr(dicom_data, 'RescaleSlope') and hasattr(dicom_data, 'RescaleIntercept'):
+                dicom_array = dicom_array * dicom_data.RescaleSlope + dicom_data.RescaleIntercept
+            
+            processed_img = self.apply_windows_and_clahe(dicom_array)
+            
+            processed_tensor = torch.tensor(processed_img, dtype=torch.float32)
+            
+            processed_tensor = processed_tensor / 255.0
+            
+            return processed_tensor
         
-        # Extract pixel array
-        dicom_array = dicom_data.pixel_array
-        
-        # Normalize to Hounsfield units if needed
-        if hasattr(dicom_data, 'RescaleSlope') and hasattr(dicom_data, 'RescaleIntercept'):
-            dicom_array = dicom_array * dicom_data.RescaleSlope + dicom_data.RescaleIntercept
-        
-        # Apply windowing and CLAHE
-        processed_img = self.apply_windows_and_clahe(dicom_array)
-        
-        # Convert to PyTorch tensor [3, H, W]
-        processed_tensor = torch.tensor(processed_img, dtype=torch.float32)
-        
-        # Normalize to [0, 1] range
-        processed_tensor = processed_tensor / 255.0
-        
-        return processed_tensor
+        except Exception as e:
+            print(f"Error processing DICOM file {dicom_path}: {e}")
+            return torch.zeros((3, self.output_size[0], self.output_size[1]), dtype=torch.float32)
+            
+    def process_single_tensor(self, img_tensor):
+        """Process a single tensor image"""
+        try:
+            if img_tensor.dim() == 3 and img_tensor.shape[0] == 3:
+                return img_tensor
+            
+            if img_tensor.dim() > 2:
+                img_tensor = img_tensor.mean(dim=0) if img_tensor.dim() == 3 else img_tensor.squeeze()
+                
+            img_np = img_tensor.detach().cpu().numpy()
+            processed_img = self.apply_windows_and_clahe(img_np)
+            processed_tensor = torch.tensor(processed_img, dtype=torch.float32, device=img_tensor.device)
+            processed_tensor = processed_tensor / 255.0
+            return processed_tensor
+        except Exception as e:
+            print(f"Error processing tensor image: {e}")
+            return torch.zeros((3, self.output_size[0], self.output_size[1]), dtype=torch.float32, device=img_tensor.device)
             
     def apply_windows_and_clahe(self, dicom_array):
         """Apply windowing and CLAHE to a single numpy array"""
+        if dicom_array.ndim > 2:
+            dicom_array = np.mean(dicom_array, axis=0) if dicom_array.ndim == 3 else dicom_array.squeeze()
+        
         channels = []
         for window in self.window_settings:
-            # Apply windowing
-            img_min = window["center"] - window["width"] // 2
-            img_max = window["center"] + window["width"] // 2
-            windowed = np.clip(dicom_array, img_min, img_max)
-            windowed = ((windowed - img_min) / (img_max - img_min) * 255).astype(np.uint8)
-            
-            # Apply CLAHE enhancement
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(windowed)
-            
-            channels.append(enhanced)
+            try:
+                img_min = window["center"] - window["width"] // 2
+                img_max = window["center"] + window["width"] // 2
+                windowed = np.clip(dicom_array, img_min, img_max)
+                windowed = ((windowed - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+                
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                
+                if self.output_size:
+                    windowed = cv2.resize(windowed, (self.output_size[1], self.output_size[0]), interpolation=cv2.INTER_AREA)
+                
+                if windowed.ndim != 2:
+                    windowed = windowed.squeeze()
+                
+                enhanced = clahe.apply(windowed)
+                channels.append(enhanced)
+            except Exception as e:
+                print(f"Error in window {window}: {e}")
+                placeholder = np.zeros(self.output_size, dtype=np.uint8)
+                channels.append(placeholder)
         
-        # Combine 3 channels
         multichannel_image = np.stack(channels)
-        
-        # Resize if needed
-        if self.output_size:
-            resized_channels = []
-            for i in range(3):
-                resized = cv2.resize(channels[i], 
-                                   (self.output_size[1], self.output_size[0]), 
-                                   interpolation=cv2.INTER_AREA)
-                resized_channels.append(resized)
-            multichannel_image = np.stack(resized_channels)
         
         return multichannel_image
 
-class CombinedToEfficientNet(nn.Module):
-    def __init__(self, pretrained=True, freeze_base=True):
-        super(CombinedToEfficientNet, self).__init__()
+class SingleEfficientNetExtractor(nn.Module):
+    """
+    Single EfficientNetB7 feature extraction pathway that processes YOLO detections, segmentations, and DICOM data
+    """
+    def __init__(self, pretrained=True, freeze_base=True, device='cuda'):
+        super(SingleEfficientNetExtractor, self).__init__()
+        self.device = device
         
-        # Load pretrained EfficientNetB7 model
-        self.efficientnet = models.efficientnet_b7(pretrained=pretrained)
+        weights = EfficientNet_B7_Weights.IMAGENET1K_V1 if pretrained else None
+        self.yolo_stream = efficientnet_b7(weights=weights)
         
-        # Get the feature output size (typically 2560 for EfficientNet-B7)
-        self.feature_size = self.efficientnet.classifier[1].in_features
-        
-        # Remove the classifier to get features
-        self.efficientnet.classifier = nn.Identity()
-        
-        # Freeze base model if specified
         if freeze_base:
-            for param in self.efficientnet.parameters():
+            self.freeze_base()
+        
+        self.yolo_stream.features[0][0] = self._modify_first_conv(self.yolo_stream.features[0][0], in_channels=5)
+        
+        self.feature_size = self.yolo_stream.classifier[1].in_features
+        
+        self.yolo_stream.classifier = nn.Identity()
+
+    def freeze_base(self):
+        """Freeze the base EfficientNet model."""
+        for param in self.yolo_stream.parameters():
+            param.requires_grad = False
+
+    def unfreeze_base(self):
+        """Unfreeze only the last two layers of the EfficientNet model."""
+        for name, param in self.yolo_stream.named_parameters():
+            if 'features.8' in name or 'features.9' in name:
+                param.requires_grad = True
+            else:
                 param.requires_grad = False
     
-    def detection_to_heatmap(self, detections, image_size=(640, 640)):
+    def _modify_first_conv(self, conv, in_channels):
+        """Replace a Conv2d layer with a new one expecting in_channels channels.
+           New channels are initialized as the average of the original channels.
         """
-        Convert YOLO detections to heatmap
+        old_weight = conv.weight.data
+        out_channels = conv.out_channels
+        kernel_size = conv.kernel_size
+        stride = conv.stride
+        padding = conv.padding
+        bias_flag = conv.bias is not None
+
+        new_conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size,
+                             stride=stride, padding=padding, bias=bias_flag)
+        with torch.no_grad():
+            new_conv.weight[:, :3, :, :] = old_weight  
+            if in_channels > 3:
+                avg = old_weight.mean(dim=1, keepdim=True)
+                new_conv.weight[:, 3:in_channels, :, :] = avg.repeat(1, in_channels-3, 1, 1)
+            if bias_flag:
+                new_conv.bias = conv.bias
+        return new_conv
         
-        Args:
-            detections: List of detections, each being [x, y, w, h, conf, class]
-                        where x,y,w,h are normalized coordinates (0-1)
-            image_size: Target image size (height, width)
-            
-        Returns:
-            Tensor of shape (batch_size, 3, height, width) for detection channel
-        """
-        batch_size = len(detections)
-        height, width = image_size
+    def detection_to_heatmap(self, detections, image_size=(640, 640), batch_size=None):
+        if batch_size is None:
+            batch_size = len(detections)
+        heatmaps = torch.zeros((batch_size, 1, image_size[0], image_size[1]), device=self.device)
         
-        # Create empty heatmaps for detection channel
-        heatmaps = torch.zeros(batch_size, 3, height, width, device=detections[0].device 
-                              if len(detections) > 0 and isinstance(detections[0], torch.Tensor) 
-                              else 'cpu')
-        
-        for b, detection_list in enumerate(detections):
-            # Skip if no detections
-            if len(detection_list) == 0:
+        if not detections or len(detections) == 0:
+            return heatmaps
+
+        for img_idx in range(batch_size):
+            img_detections = detections[img_idx]
+            if img_detections.ndim < 2:
                 continue
-                
-            # Process each detection
-            for det in detection_list:
-                # YOLO format: [x_center, y_center, width, height, confidence, class]
-                x_center, y_center, box_width, box_height, confidence = det[:5]
-                
-                # Convert normalized coordinates to pixel values
-                x_center = int(x_center * width)
-                y_center = int(y_center * height)
-                box_width = int(box_width * width)
-                box_height = int(box_height * height)
-                
-                # Calculate box boundaries
-                x1 = max(0, int(x_center - box_width / 2))
-                y1 = max(0, int(y_center - box_height / 2))
-                x2 = min(width - 1, int(x_center + box_width / 2))
-                y2 = min(height - 1, int(y_center + box_height / 2))
-                
-                # Fill the box with confidence value
-                heatmaps[b, :, y1:y2+1, x1:x2+1] = confidence
-        
-        return heatmaps
-        
-    def segmentation_to_heatmap(self, segmentations, image_size=(640, 640)):
-        """
-        Convert YOLO segmentations to heatmap
-        
-        Args:
-            segmentations: List of segmentations, each containing polygons
-                           where each polygon is [class_id, x1, y1, x2, y2, ...]
-                           with x,y being normalized coordinates (0-1)
-            image_size: Target image size (height, width)
-            
-        Returns:
-            Tensor of shape (batch_size, 3, height, width) for segmentation channel
-        """
-        batch_size = len(segmentations)
-        height, width = image_size
-        
-        # Create empty heatmaps for the batch
-        heatmaps = torch.zeros(batch_size, 3, height, width, device=segmentations[0].device 
-                               if len(segmentations) > 0 and isinstance(segmentations[0], torch.Tensor) 
-                               else 'cpu')
-        
-        # Process each image in the batch
-        for b, segmentation_list in enumerate(segmentations):
-            # Skip if no segmentations
-            if len(segmentation_list) == 0:
-                continue
-            
-            # Create a CPU numpy array for OpenCV operations
-            heatmap_np = np.zeros((height, width), dtype=np.float32)
-            
-            # Process each segmentation polygon
-            for seg in segmentation_list:
-                # Extract class_id and points
-                class_id = seg[0]
-                points = seg[1:].reshape(-1, 2)
-                
-                # Convert normalized points to pixel coordinates
-                points_px = points.clone()
-                points_px[:, 0] *= width
-                points_px[:, 1] *= height
-                points_px = points_px.cpu().numpy().astype(np.int32)
-                
-                # Get confidence (use 1.0 or last element if available)
-                confidence = 1.0
-                if hasattr(seg, 'confidence'):
-                    confidence = seg.confidence
-                
-                # Draw filled polygon with confidence value
-                cv2.fillPoly(heatmap_np, [points_px], confidence)
-            
-            # Convert back to tensor and assign to all channels
-            heatmap_tensor = torch.from_numpy(heatmap_np).to(heatmaps.device)
-            heatmaps[b, 0, :, :] = heatmap_tensor
-            heatmaps[b, 1, :, :] = heatmap_tensor
-            heatmaps[b, 2, :, :] = heatmap_tensor
-        
+            for box_idx in range(img_detections.shape[0]):
+                if img_detections.shape[1] < 5:
+                    continue
+                box = img_detections[box_idx, :4]
+                conf = img_detections[box_idx, 4]
+                x1 = int((box[0] * image_size[1]).clamp(0, image_size[1]-1))
+                y1 = int((box[1] * image_size[0]).clamp(0, image_size[0]-1))
+                x2 = int((box[2] * image_size[1]).clamp(0, image_size[1]-1))
+                y2 = int((box[3] * image_size[0]).clamp(0, image_size[0]-1))
+                if x2 > x1 and y2 > y1:
+                    heatmaps[img_idx, 0, y1:y2, x1:x2] += conf
+        max_val = heatmaps.max()
+        if max_val > 0:
+            heatmaps /= max_val
         return heatmaps
 
-    def forward(self, detection_segmentation_tuple):
-        """
-        Forward pass: Combine detection and segmentation data into a single tensor,
-        then feed to EfficientNet
+    def segmentation_to_heatmap(self, segmentations, image_size=(640, 640), batch_size=None):
+        """Convert YOLO segmentation masks to a heatmap tensor"""
+        if batch_size is None:
+            batch_size = len(segmentations)
+            
+        heatmaps = torch.zeros((batch_size, 1, image_size[0], image_size[1]), device=self.device)
+        
+        if not segmentations or len(segmentations) == 0:
+            return heatmaps
+            
+        for img_idx in range(min(batch_size, len(segmentations))):
+            result = segmentations[img_idx]
+            
+            if hasattr(result, 'masks') and result.masks is not None and len(result.masks) > 0:
+                mask_tensor = result.masks.data
+                
+                if len(mask_tensor) > 0:
+                    mask = mask_tensor[0]
+                    
+                    mask_resized = torch.nn.functional.interpolate(
+                        mask.unsqueeze(0).unsqueeze(0).float(),
+                        size=image_size,
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze()
+                    
+                    heatmaps[img_idx, 0] = mask_resized
+        
+        max_val = heatmaps.max()
+        if max_val > 0:
+            heatmaps = heatmaps / max_val
+            
+        return heatmaps
+
+    def create_combined_tensor(self, detection_segmentation_tuple, dicom_tensor):
+        detections, segmentations = detection_segmentation_tuple
+        batch_size = dicom_tensor.shape[0]
+        det_heatmap = self.detection_to_heatmap(detections, image_size=(dicom_tensor.shape[2], dicom_tensor.shape[3]), batch_size=batch_size)
+        seg_heatmap = self.segmentation_to_heatmap(segmentations, image_size=(dicom_tensor.shape[2], dicom_tensor.shape[3]), batch_size=batch_size)
+        
+        if dicom_tensor.dim() == 3:
+            dicom_tensor = dicom_tensor.unsqueeze(0)
+            
+        combined = torch.cat([dicom_tensor, det_heatmap, seg_heatmap], dim=1)
+        return combined
+
+    def forward(self, inputs):
+        """Forward pass through single EfficientNet pathway
         
         Args:
-            detection_segmentation_tuple: Tuple containing:
-                - List of detections per image in batch
-                - List of segmentations per image in batch
-            
+            inputs: Tuple of (yolo_outputs, dicom_tensor)
+                - yolo_outputs: Tuple of (detections, segmentations)
+                - dicom_tensor: Preprocessed DICOM image tensor [batch, 3, H, W]
+        
         Returns:
-            Feature vector from EfficientNet (2560-dim)
+            Feature vector from the EfficientNet model
         """
-        # Unpack tuple
-        detections, segmentations = detection_segmentation_tuple
+        yolo_outputs, dicom_tensor = inputs
         
-        # Convert detections and segmentations to heatmaps
-        detection_heatmaps = self.detection_to_heatmap(detections)
-        segmentation_heatmaps = self.segmentation_to_heatmap(segmentations)
+        device = next(self.parameters()).device
         
-        # Combine the heatmaps:
-        # - Use detection for Red channel
-        # - Use segmentation for Green channel
-        # - Use zeros for Blue channel
-        batch_size = detection_heatmaps.shape[0]
-        height, width = 640, 640
+        if dicom_tensor.device != device:
+            dicom_tensor = dicom_tensor.to(device)
+            
+        stream_input = self.create_combined_tensor(yolo_outputs, dicom_tensor)
         
-        combined_heatmaps = torch.zeros(batch_size, 3, height, width, 
-                                      device=detection_heatmaps.device)
+        stream_input = stream_input.to(device, dtype=torch.float)
         
-        # Red channel - Detection
-        combined_heatmaps[:, 0, :, :] = detection_heatmaps[:, 0, :, :]
-        
-        # Green channel - Segmentation
-        combined_heatmaps[:, 1, :, :] = segmentation_heatmaps[:, 0, :, :]
-        
-        # Blue channel - You could leave as zeros or combine them
-        combined_heatmaps[:, 2, :, :] = detection_heatmaps[:, 0, :, :] * segmentation_heatmaps[:, 0, :, :]
-        
-        # Pass through EfficientNet
-        features = self.efficientnet(combined_heatmaps)
+        features = self.yolo_stream(stream_input)
         
         return features
-    
-class BinaryClassificationHead(nn.Module):
-    def __init__(self, dropout_rate=0.3):
-        super(BinaryClassificationHead, self).__init__()
+
+class EnhancedClassificationHead(nn.Module):
+    """
+    Enhanced classification head with strong regularization to prevent overfitting
+    """
+    def __init__(self, in_features=2560, dropout_rate=0.5):
+        super(EnhancedClassificationHead, self).__init__()
         
-        # Input size is fixed at 2560 (EfficientNet feature output)
-        in_features = 2560
-        
-        # Define layers for binary classification
         self.dropout1 = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(in_features, 512)
-        self.bn1 = nn.BatchNorm1d(512)
+        self.fc1 = nn.Linear(in_features, 1024)
+        self.bn1 = nn.BatchNorm1d(1024)
         
         self.dropout2 = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(512, 128)
-        self.bn2 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(1024, 256)
+        self.bn2 = nn.BatchNorm1d(256)
         
         self.dropout3 = nn.Dropout(dropout_rate)
-        self.fc3 = nn.Linear(128, 1)  # Single output for binary classification
+        self.fc3 = nn.Linear(256, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        
+        self.dropout4 = nn.Dropout(dropout_rate)
+        self.fc4 = nn.Linear(64, 1)
         
     def forward(self, x):
-        # First block
         x = self.dropout1(x)
         x = self.fc1(x)
         x = self.bn1(x)
         x = F.relu(x)
         
-        # Second block
         x = self.dropout2(x)
         x = self.fc2(x)
         x = self.bn2(x)
         x = F.relu(x)
         
-        # Output layer
         x = self.dropout3(x)
         x = self.fc3(x)
+        x = self.bn3(x)
+        x = F.relu(x)
         
-        # No activation here - use with nn.BCEWithLogitsLoss for better numerical stability
+        x = self.dropout4(x)
+        x = self.fc4(x)
+        
         return x
-    
+
 class BaksiDetection(nn.Module):
     """
-    Complete stroke detection model that combines preprocessing, YOLO detection & segmentation,
-    EfficientNet feature extraction, and binary classification
+    Complete stroke detection model with single EfficientNet architecture
     """
-    def __init__(self, det_model_path, seg_model_path, pretrained=True, device='cuda'):
+    def __init__(self, det_model_path, seg_model_path, pretrained=True, device='cuda', **kwargs):
+        """
+        Initialize the model with backward compatibility for train.py
+        
+        Args:
+            det_model_path: Path to YOLO detection model
+            seg_model_path: Path to YOLO segmentation model
+            pretrained: Whether to use pretrained EfficientNet weights
+            device: Device to run the model on
+            **kwargs: Extra parameters for compatibility with train.py
+        """
         super(BaksiDetection, self).__init__()
         
-        # Initialize components
         self.preprocessor = PreprocessorLayer(output_size=(640, 640))
         self.yolo_predictor = YOLOPredictor(det_model_name=det_model_path, seg_model_name=seg_model_path)
-        self.feature_extractor = CombinedToEfficientNet(pretrained=pretrained, freeze_base=True)
-        self.classifier = BinaryClassificationHead(dropout_rate=0.3)
+        self.feature_extractor = SingleEfficientNetExtractor(pretrained=pretrained, freeze_base=True)
+        self.classifier = EnhancedClassificationHead(in_features=self.feature_extractor.feature_size)
         self.device = device
         
-        # Move model to device
         self.to(device)
-        
-        # Freeze all components except the classification head
-        self._freeze_components()
-    
-    def _freeze_components(self):
-        """Freeze all components except the classification head"""
-        # Freeze preprocessor
-        for param in self.preprocessor.parameters():
-            param.requires_grad = False
-        
-        # YOLO predictor doesn't have parameters to freeze in PyTorch sense
-        
-        # Freeze feature extractor (although it's already frozen in its constructor)
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-        
-        # Make sure classifier is trainable
-        for param in self.classifier.parameters():
-            param.requires_grad = True
     
     def forward(self, x):
         """
@@ -558,59 +461,53 @@ class BaksiDetection(nn.Module):
         
         Args:
             x: Input, can be either:
-               - List of DICOM file paths
-               - Batch tensor of DICOM pixel arrays
-               
+            - List of DICOM file paths
+            - Batch tensor of DICOM pixel arrays
+            - Dictionary with 'windowed_img' for compatibility with train.py
+                
         Returns:
             Classification logits (0 = no stroke, 1 = stroke)
         """
-        # 1. Preprocess DICOM images to get CT with windowing & CLAHE applied
-        processed_images = self.preprocessor(x)
+        if isinstance(x, dict) and 'windowed_img' in x:
+            dicom_tensor = x['windowed_img']
+            
+            image_list = [img.permute(1, 2, 0).cpu().numpy() * 255 for img in dicom_tensor]
+        else:
+            dicom_tensor = self.preprocessor(x)
+
+            image_list = [img.permute(1, 2, 0).cpu().numpy() * 255 for img in dicom_tensor]
         
-        # 2. Convert processed tensor images to numpy arrays for YOLO
-        image_list = [img.permute(1, 2, 0).cpu().numpy() * 255 for img in processed_images]
-        
-        # 3. Run YOLO detection and segmentation on the images
         yolo_outputs = self.yolo_predictor.process_batch(image_list)
         
-        # 4. Feed YOLO outputs to EfficientNet to extract features
-        features = self.feature_extractor(yolo_outputs)
+        features = self.feature_extractor((yolo_outputs, dicom_tensor))
         
-        # 5. Classify features with the binary classification head
         logits = self.classifier(features)
         
         return logits
+  
+    def freeze_backbone(self):
+        """Freeze the EfficientNet backbones."""
+        self.feature_extractor.freeze_base()
 
+    def unfreeze_backbone(self):
+        """Unfreeze only the last two layers of the EfficientNet backbones."""
+        self.feature_extractor.unfreeze_base()    
+    
     def train_step(self, batch, criterion, optimizer):
-        """
-        Perform a single training step
-        
-        Args:
-            batch: Tuple of (inputs, labels)
-            criterion: Loss function (BCEWithLogitsLoss recommended)
-            optimizer: Optimizer for classifier parameters
-            
-        Returns:
-            Dictionary with loss and accuracy metrics
-        """
+        """Perform a single training step"""
         self.train()
         inputs, labels = batch
         
-        # Move labels to device
         labels = labels.to(self.device)
         
-        # Zero the gradients
         optimizer.zero_grad()
         
-        # Forward pass
         outputs = self(inputs)
         loss = criterion(outputs, labels.float().unsqueeze(1))
         
-        # Backward pass and optimize
         loss.backward()
         optimizer.step()
         
-        # Calculate metrics
         predictions = (torch.sigmoid(outputs) >= 0.5).long()
         correct = (predictions.squeeze() == labels).sum().item()
         total = labels.size(0)
@@ -621,16 +518,7 @@ class BaksiDetection(nn.Module):
         }
 
     def evaluate(self, dataloader, criterion):
-        """
-        Evaluate the model on a dataset
-        
-        Args:
-            dataloader: DataLoader with validation/test data
-            criterion: Loss function (same as used in training)
-            
-        Returns:
-            Dictionary with loss and accuracy metrics
-        """
+        """Evaluate the model on a dataset"""
         self.eval()
         total_loss = 0
         all_predictions = []
@@ -641,18 +529,15 @@ class BaksiDetection(nn.Module):
                 inputs, labels = batch
                 labels = labels.to(self.device)
                 
-                # Forward pass
                 outputs = self(inputs)
                 loss = criterion(outputs, labels.float().unsqueeze(1))
                 
-                # Save predictions and labels
                 predictions = (torch.sigmoid(outputs) >= 0.5).cpu().numpy()
                 all_predictions.extend(predictions.squeeze())
                 all_labels.extend(labels.cpu().numpy())
                 
                 total_loss += loss.item()
         
-        # Calculate metrics
         accuracy = (np.array(all_predictions) == np.array(all_labels)).mean()
         
         return {
@@ -661,15 +546,7 @@ class BaksiDetection(nn.Module):
         }
 
     def predict(self, inputs):
-        """
-        Make predictions on new data
-        
-        Args:
-            inputs: List of DICOM paths or tensor of DICOM images
-            
-        Returns:
-            Dictionary with logits, probabilities and binary predictions
-        """
+        """Make predictions on new data"""
         self.eval()
         
         with torch.no_grad():

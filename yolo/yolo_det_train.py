@@ -1,30 +1,38 @@
 from ultralytics import YOLO
+import torch
+import time
 
-model = YOLO('yolo11m.pt')
+torch.cuda.empty_cache()
+
+model = YOLO('yolo11l.pt')
+
+start_time = time.time()
 
 model.train(
-    data='stroke_detection.yaml',
+    data='/home/efekaan/Desktop/baksi/yolo/stroke_detection.yaml',
     epochs=100,
-    batch=32,
+    batch=8,
     imgsz=640,
     device=0,
     workers=8,
-    optimizer='SGD',
+    
+    optimizer='AdamW',
+    lr0=0.001,
+    lrf=0.01,
+    weight_decay=0.0005,
+    warmup_epochs=5,
+    
+    iou=0.3,
+    patience=0,
+    save_period=5,
+    verbose=True,
+    conf=0.01,
+    agnostic_nms=True,
     augment=True,
-    degrees=5,
-    scale=0.05,
-    shear=0.0, 
-    perspective=0.0,
-    flipud=0.0,
-    fliplr=0.0,
-    hsv_h=0.0,
-    hsv_s=0.0,
-    hsv_v=0.0,
-    mosaic=0.0,
-    mixup=0.0,
-    copy_paste=0.0,
-    blur=0.1,
-    save_period=10,
-    patience=20,
-    verbose=True
 )
+
+end_time = time.time()
+total_time = end_time - start_time
+
+print(f"\n===== EĞİTİM TAMAMLANDI =====")
+print(f"Toplam Eğitim Süresi: {total_time:.2f} saniye")
